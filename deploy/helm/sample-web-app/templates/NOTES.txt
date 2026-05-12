@@ -1,0 +1,13 @@
+sample-web-app has been deployed.
+
+1. Port-forward to reach it locally:
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "sample-web-app.fullname" . }} 8080:{{ .Values.service.port }}
+
+2. Try the API:
+   curl http://localhost:8080/api/items
+   curl -X POST http://localhost:8080/api/items \
+     -H 'Content-Type: application/json' \
+     -d '{"name":"widget","quantity":3}'
+
+3. Prometheus metrics:
+   curl http://localhost:8080/actuator/prometheus

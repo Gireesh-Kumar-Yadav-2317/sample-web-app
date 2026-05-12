@@ -1,0 +1,42 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+nb-configuration.xml
+nbactions.xml
+spring.factories
+
+# Spring Boot
+HELP.md
+.attach_pid*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Docker
+.docker/

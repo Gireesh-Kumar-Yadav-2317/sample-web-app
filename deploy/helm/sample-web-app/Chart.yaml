@@ -1,0 +1,16 @@
+apiVersion: v2
+name: sample-web-app
+description: OneMoreTechie reference Spring Boot 3 web app — Helm chart with HPA, PDB, Ingress, and probes wired in.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - spring-boot
+  - java
+  - reference
+  - tutorial
+home: https://github.com/onemoretechie/sample-web-app
+sources:
+  - https://github.com/onemoretechie/sample-web-app
+maintainers:
+  - name: OneMoreTechie
