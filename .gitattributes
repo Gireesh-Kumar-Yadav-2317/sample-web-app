@@ -13,3 +13,10 @@ mvnw          text eol=lf
 *.jar         binary
 *.png         binary
 *.jpg         binary
+
+
+* text=auto
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf

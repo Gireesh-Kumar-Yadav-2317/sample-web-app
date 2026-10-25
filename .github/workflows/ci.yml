@@ -1,83 +1,198 @@
-name: ci
+
+name: Sample Web App CI/CD
 
 on:
   push:
-    branches: [main]
-    tags: ['v*.*.*']
+    branches:
+      - main
+      - 'feature/**'
+    tags:
+      - 'v*'
   pull_request:
-    branches: [main]
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  APP_NAME: ${{ vars.APP_NAME }}
+  JAVA_VERSION: ${{ vars.JAVA_VERSION }}
 
 jobs:
   test:
-    name: build & test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    name: Java CI and Compose Validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+    env:
+      DB_NAME: ${{ vars.DB_NAME }}
+      DB_USER: ${{ vars.DB_USER }}
+      APP_PORT: ${{ vars.APP_PORT }}
+      APP_VERSION: ${{ vars.APP_VERSION }}
+      POSTGRES_PASSWORD: ${{ format('ci-{0}-{1}', github.run_id, github.run_attempt) }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in APP_NAME JAVA_VERSION DB_NAME DB_USER APP_PORT APP_VERSION POSTGRES_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing configuration: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: ${{ env.JAVA_VERSION }}
           cache: maven
 
-      - name: Maven verify
-        run: mvn -B -ntp verify
+      - name: Validate Docker Compose
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose config -q
 
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports
-          path: target/surefire-reports
-          if-no-files-found: ignore
+      - name: Run Maven verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f ./mvnw ]]; then
+            echo "::error::Maven wrapper ./mvnw not found."
+            exit 1
+          fi
+
+          chmod +x ./mvnw
+          ./mvnw -B -ntp verify
 
   image:
-    name: build & push image
+    name: Build, Scan and Publish Image
     needs: test
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+      DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      LOCAL_IMAGE: local/${{ vars.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Validate image configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in DOCKERHUB_USERNAME DOCKERHUB_REPOSITORY; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub variable: ${name}"
+              exit 1
+            fi
+          done
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract image metadata
+      - name: Generate Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: docker.io/${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPOSITORY }}
           tags: |
+            type=sha,prefix=sha-
             type=ref,event=branch
             type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
-            type=sha,format=short
+            type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build & push
-        uses: docker/build-push-action@v6
+      - name: Build image for scanning
+        uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+          file: ./Dockerfile
+          pull: true
+          push: false
+          load: true
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha,scope=${{ vars.DOCKERHUB_REPOSITORY }}
+          cache-to: type=gha,mode=max,scope=${{ vars.DOCKERHUB_REPOSITORY }}
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Validate publishing configuration
+        if: >-
+          github.event_name == 'push' &&
+          (
+            github.ref == format('refs/heads/{0}', vars.RELEASE_BRANCH) ||
+            startsWith(github.ref, 'refs/tags/v')
+          )
+        shell: bash
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH }}
+        run: |
+          set -euo pipefail
+
+          for name in DOCKERHUB_USERNAME DOCKERHUB_REPOSITORY DOCKERHUB_TOKEN RELEASE_BRANCH; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing publishing configuration: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Log in to Docker Hub
+        if: >-
+          github.event_name == 'push' &&
+          (
+            github.ref == format('refs/heads/{0}', vars.RELEASE_BRANCH) ||
+            startsWith(github.ref, 'refs/tags/v')
+          )
+        uses: docker/login-action@v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish scanned image
+        if: >-
+          github.event_name == 'push' &&
+          (
+            github.ref == format('refs/heads/{0}', vars.RELEASE_BRANCH) ||
+            startsWith(github.ref, 'refs/tags/v')
+          )
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r image_tag; do
+            [[ -n "${image_tag}" ]] || continue
+
+            docker tag "${LOCAL_IMAGE}" "${image_tag}"
+            docker push "${image_tag}"
+          done <<< "${IMAGE_TAGS}"

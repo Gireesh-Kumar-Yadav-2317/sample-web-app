@@ -1,33 +1,92 @@
+
+name: sample-web-app
+
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
+
     environment:
-      POSTGRES_USER: sample
-      POSTGRES_PASSWORD: sample
-      POSTGRES_DB: sample
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sample -d sample"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      POSTGRES_DB: ${DB_NAME:-sample}
+      POSTGRES_USER: ${DB_USER:-sample}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - db_net
+
+    cpus: 1.0
+    mem_limit: 1g
+
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   app:
+    image: sample-web-app:${APP_VERSION:-1.0}
+
     build:
       context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+
+    ports:
+      - "127.0.0.1:${APP_PORT:-8081}:8080"
+
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://${DB_HOST:-postgres}:${DB_PORT:-5432}/${DB_NAME:-sample}
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-sample}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      SPRING_PROFILES_ACTIVE: docker
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/sample
-      SPRING_DATASOURCE_USERNAME: sample
-      SPRING_DATASOURCE_PASSWORD: sample
-    ports:
-      - "8080:8080"
+
+    networks:
+      - app_net
+      - db_net
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    cpus: 1.0
+    mem_limit: 768m
+
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  app_net:
+  db_net:
+    internal: true
 
 volumes:
   postgres_data:
