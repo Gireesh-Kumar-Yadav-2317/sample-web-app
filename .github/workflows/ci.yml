@@ -15,60 +15,93 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: sample-web-app-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  APP_NAME: ${{ vars.APP_NAME }}
-  JAVA_VERSION: ${{ vars.JAVA_VERSION }}
 
 jobs:
   test:
-    name: Java CI and Compose Validation
+    name: Test and Validate
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
 
-    env:
-      DB_NAME: ${{ vars.DB_NAME }}
-      DB_USER: ${{ vars.DB_USER }}
-      APP_PORT: ${{ vars.APP_PORT }}
-      APP_VERSION: ${{ vars.APP_VERSION }}
-      POSTGRES_PASSWORD: ${{ format('ci-{0}-{1}', github.run_id, github.run_attempt) }}
+    outputs:
+      image_changed: ${{ steps.filter.outputs.image }}
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
+
+      # Detect changes that can affect the application image.
+      # Tags and manual runs deliberately bypass this filter.
+      - name: Detect image-related changes
+        id: filter
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          !(github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v'))
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            image:
+              - 'src/**'
+              - 'pom.xml'
+              - 'mvnw'
+              - '.mvn/**'
+              - 'Dockerfile'
+              - 'Dockerfile.*'
+              - '.dockerignore'
+              - 'docker-compose.yml'
+              - 'docker-compose.yaml'
+              - 'application*.properties'
+              - '.github/workflows/**'
 
       - name: Validate required configuration
         shell: bash
+        env:
+          JAVA_VERSION: ${{ vars.JAVA_VERSION }}
+          APP_NAME: ${{ vars.APP_NAME }}
         run: |
           set -euo pipefail
 
-          for name in APP_NAME JAVA_VERSION DB_NAME DB_USER APP_PORT APP_VERSION POSTGRES_PASSWORD; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing configuration: ${name}"
-              exit 1
-            fi
-          done
+          test -n "$JAVA_VERSION" || {
+            echo "::error::Configure JAVA_VERSION in repository variables."
+            exit 1
+          }
+
+          test -n "$APP_NAME" || {
+            echo "::error::Configure APP_NAME in repository variables."
+            exit 1
+          }
 
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: ${{ vars.JAVA_VERSION }}
           cache: maven
 
-      - name: Validate Docker Compose
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose config -q
       - name: Set up Maven
         uses: stCarolas/setup-maven@v5
         with:
           maven-version: '3.9.9'
+
+      - name: Validate Docker Compose configuration
+        shell: bash
+        env:
+          # Disposable CI-only values. No real database credentials.
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          POSTGRES_DB: ci_db
+          DB_USER: ci_user
+          DB_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          DB_NAME: ci_db
+          APP_PORT: ${{ vars.APP_PORT || '8080' }}
+        run: |
+          set -euo pipefail
+          docker compose config -q
 
       - name: Run Maven verification
         shell: bash
@@ -82,44 +115,30 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
+    # Build only when relevant files changed, on manual runs,
+    # or for version tags.
+    if: >-
+      needs.test.result == 'success' &&
+      (
+        needs.test.outputs.image_changed == 'true' ||
+        github.event_name == 'workflow_dispatch' ||
+        startsWith(github.ref, 'refs/tags/v')
+      )
+
     env:
       DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
       DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+      RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH }}
       LOCAL_IMAGE: local/${{ vars.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
-
-      - name: Validate image configuration
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for name in DOCKERHUB_USERNAME DOCKERHUB_REPOSITORY; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing GitHub variable: ${name}"
-              exit 1
-            fi
-          done
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
-      - name: Generate Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: docker.io/${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_REPOSITORY }}
-          tags: |
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=ref,event=tag
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - name: Build image for scanning
+      - name: Build image for verification
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -128,19 +147,21 @@ jobs:
           push: false
           load: true
           tags: ${{ env.LOCAL_IMAGE }}
-          cache-from: type=gha,scope=${{ vars.DOCKERHUB_REPOSITORY }}
-          cache-to: type=gha,mode=max,scope=${{ vars.DOCKERHUB_REPOSITORY }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Scan image for vulnerabilities
+      # Keep the security gate enabled.
+      - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.LOCAL_IMAGE }}
           format: table
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: true
+          exit-code: '1'
 
+      # Publish only from the configured release branch or
+      # a version tag. Pull requests and feature branches never publish.
       - name: Validate publishing configuration
         if: >-
           github.event_name == 'push' &&
@@ -151,16 +172,28 @@ jobs:
         shell: bash
         env:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH }}
         run: |
           set -euo pipefail
 
-          for name in DOCKERHUB_USERNAME DOCKERHUB_REPOSITORY DOCKERHUB_TOKEN RELEASE_BRANCH; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "::error::Missing publishing configuration: ${name}"
-              exit 1
-            fi
-          done
+          test -n "$DOCKERHUB_USERNAME" || {
+            echo "::error::DOCKERHUB_USERNAME is not configured."
+            exit 1
+          }
+
+          test -n "$DOCKERHUB_REPOSITORY" || {
+            echo "::error::DOCKERHUB_REPOSITORY is not configured."
+            exit 1
+          }
+
+          test -n "$RELEASE_BRANCH" || {
+            echo "::error::RELEASE_BRANCH is not configured."
+            exit 1
+          }
+
+          test -n "$DOCKERHUB_TOKEN" || {
+            echo "::error::DOCKERHUB_TOKEN secret is not configured."
+            exit 1
+          }
 
       - name: Log in to Docker Hub
         if: >-
@@ -169,27 +202,32 @@ jobs:
             github.ref == format('refs/heads/{0}', vars.RELEASE_BRANCH) ||
             startsWith(github.ref, 'refs/tags/v')
           )
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Publish scanned image
+      - name: Publish verified image
         if: >-
           github.event_name == 'push' &&
           (
             github.ref == format('refs/heads/{0}', vars.RELEASE_BRANCH) ||
             startsWith(github.ref, 'refs/tags/v')
           )
-        env:
-          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         shell: bash
         run: |
           set -euo pipefail
 
-          while IFS= read -r image_tag; do
-            [[ -n "${image_tag}" ]] || continue
+          IMAGE_REPO="${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}"
 
-            docker tag "${LOCAL_IMAGE}" "${image_tag}"
-            docker push "${image_tag}"
-          done <<< "${IMAGE_TAGS}"
+          # Publish the exact local image that passed the Trivy scan.
+          docker tag "$LOCAL_IMAGE" "$IMAGE_REPO:sha-${GITHUB_SHA}"
+          docker push "$IMAGE_REPO:sha-${GITHUB_SHA}"
+
+          if [[ "$GITHUB_REF" == "refs/heads/${RELEASE_BRANCH}" ]]; then
+            docker tag "$LOCAL_IMAGE" "$IMAGE_REPO:latest"
+            docker push "$IMAGE_REPO:latest"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            docker tag "$LOCAL_IMAGE" "$IMAGE_REPO:${GITHUB_REF_NAME}"
+            docker push "$IMAGE_REPO:${GITHUB_REF_NAME}"
+          fi
