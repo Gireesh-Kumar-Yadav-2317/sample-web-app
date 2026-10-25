@@ -74,14 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ ! -f ./mvnw ]]; then
-            echo "::error::Maven wrapper ./mvnw not found."
-            exit 1
-          fi
-
-          chmod +x ./mvnw
-          ./mvnw -B -ntp verify
+          mvn -B -ntp verify
 
   image:
     name: Build, Scan and Publish Image
